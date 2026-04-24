@@ -18,6 +18,12 @@ try:
 except ImportError:
     BM25_AVAILABLE = False
 
+try:
+    from sentence_transformers import CrossEncoder
+    RERANKER_AVAILABLE = True
+except ImportError:
+    RERANKER_AVAILABLE = False
+
 from .config import get_config
 from .logging_utils import get_logger
 from .models import PaperSource, QueryResult, TextChunk
@@ -37,6 +43,9 @@ class VectorDatabase:
     - Similarity search with configurable top-k
     """
     
+    # Cross-Encoder model for Stage 2 reranking
+    RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
     def __init__(self, collection_name: Optional[str] = None):
         """
         Initialize the vector database.
@@ -50,6 +59,7 @@ class VectorDatabase:
         self._client = None
         self._collection = None
         self._embedding_function = None
+        self._reranker = None
     
     @property
     def client(self):
@@ -350,6 +360,97 @@ class VectorDatabase:
             
             return query_results
     
+    @property
+    def reranker(self) -> Optional["CrossEncoder"]:
+        """Lazy-load the Cross-Encoder reranker model."""
+        if self._reranker is None and RERANKER_AVAILABLE:
+            logger.info(f"Loading Cross-Encoder reranker", model=self.RERANKER_MODEL)
+            self._reranker = CrossEncoder(self.RERANKER_MODEL)
+        return self._reranker
+
+    def search_with_rerank(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        retrieve_k: int = 25,
+        alpha: float = 0.5,
+        source_filter: Optional[PaperSource] = None,
+        paper_id_filter: Optional[str] = None
+    ) -> list[QueryResult]:
+        """
+        Two-stage retrieval: Hybrid Search followed by Cross-Encoder Reranking.
+
+        Stage 1 (Hybrid Search): Fast BM25 + Vector retrieval of 'retrieve_k' candidates.
+        Stage 2 (Reranking): Cross-Encoder scores each (query, chunk) pair together
+                             for higher precision, then returns top 'top_k'.
+
+        Research shows cross-encoder reranking eliminates false positives that
+        look similar mathematically but don't actually answer the question.
+
+        Args:
+            query: Search query text
+            top_k: Number of final results to return after reranking
+            retrieve_k: Number of candidates to retrieve in Stage 1 (should be >> top_k)
+            alpha: BM25 vs vector weight for Stage 1 hybrid search
+            source_filter: Optional filter by paper source
+            paper_id_filter: Optional filter by specific paper ID
+
+        Returns:
+            List of QueryResult objects sorted by rerank score (highest first)
+        """
+        top_k = top_k or self.config.default_top_k
+
+        if not RERANKER_AVAILABLE:
+            logger.warning(
+                "Cross-Encoder not available, falling back to hybrid search",
+                hint="pip install sentence-transformers"
+            )
+            return self.hybrid_search(query, top_k, alpha, source_filter, paper_id_filter)
+
+        with logger.timed_operation("search_with_rerank", query_length=len(query), top_k=top_k, retrieve_k=retrieve_k):
+            # Stage 1: Broad candidate retrieval
+            candidates = self.hybrid_search(
+                query,
+                top_k=retrieve_k,
+                alpha=alpha,
+                source_filter=source_filter,
+                paper_id_filter=paper_id_filter
+            )
+
+            if not candidates:
+                return []
+
+            logger.info(
+                f"Reranking candidates",
+                candidates=len(candidates),
+                query_preview=query[:50]
+            )
+
+            # Stage 2: Cross-Encoder scoring — processes (query, doc) pairs TOGETHER
+            pairs = [[query, result.chunk.text] for result in candidates]
+            rerank_scores = self.reranker.predict(pairs)
+
+            # Attach rerank scores and sort descending
+            reranked = [
+                QueryResult(
+                    chunk=result.chunk,
+                    score=float(score),
+                    distance_metric="cross_encoder_rerank"
+                )
+                for result, score in zip(candidates, rerank_scores)
+            ]
+            reranked.sort(key=lambda x: x.score, reverse=True)
+
+            top_results = reranked[:top_k]
+
+            logger.info(
+                f"Reranking complete",
+                final_results=len(top_results),
+                top_score=round(top_results[0].score, 4) if top_results else None
+            )
+
+            return top_results
+
     def _build_where_clause(
         self,
         source_filter: Optional[PaperSource],
