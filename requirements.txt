@@ -48,3 +48,4 @@ pytest-asyncio>=0.21.0
 
 # Compliance & Security
 cryptography>=41.0.0
+presidio-analyzer>=2.2.0
